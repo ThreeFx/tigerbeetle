@@ -89,7 +89,7 @@ pub const connections_max = replicas_max + clients_max;
 pub const message_size_max = 1 * 1024 * 1024;
 
 /// The number of full-sized messages allocated at initialization by the message bus.
-pub const message_bus_messages_max = connections_max * 4;
+pub const message_bus_messages_max = connections_max * 3 + io_depth_read + io_depth_write;
 /// The number of header-sized messages allocated at initialization by the message bus.
 /// These are much smaller/cheaper and we can therefore have many of them.
 pub const message_bus_headers_max = connections_max * connection_send_queue_max * 2;

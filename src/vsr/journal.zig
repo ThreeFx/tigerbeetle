@@ -117,6 +117,9 @@ pub fn Journal(comptime Replica: type, comptime Storage: type) type {
         /// A faulty bit is used then only to qualify the severity of the dirty bit.
         faulty: BitSet,
 
+        recovered: bool = true,
+        recovering: bool = false,
+
         pub fn init(
             allocator: *Allocator,
             storage: *Storage,
@@ -600,6 +603,117 @@ pub fn Journal(comptime Replica: type, comptime Storage: type) type {
                 "{}: read_prepare: op={} checksum={}: {s}",
                 .{ self.replica, op, checksum, notice },
             );
+        }
+
+        pub fn recover(self: *Self) void {
+            assert(!self.recovered);
+
+            if (self.recovering) return;
+            self.recovering = true;
+
+            log.debug("{}: recover: recovering", .{self.replica});
+
+            self.recover_headers(0, 0);
+            self.recover_headers(0, 1);
+        }
+
+        fn recover_headers(self: *Self, offset: u64, version: u1) void {
+            const replica = @fieldParentPtr(Replica, "journal", self);
+
+            assert(!self.recovered);
+            assert(self.recovering);
+
+            if (offset == self.size_headers) {
+                log.debug("{}: recover_headers: version={} finished reading", .{
+                    self.replica,
+                    version,
+                });
+                if (self.reads.executing() == 0) {
+                    log.debug("{}: recover_headers: both versions finished reading", .{self.replica});
+                }
+                return;
+            }
+            assert(offset < self.size_headers);
+
+            const message = replica.message_bus.get_message() orelse unreachable;
+            defer replica.message_bus.unref(message);
+
+            // We use the count of reads executing to know when both versions have finished reading:
+            // We expect that no other process is issuing reads while we are recovering.
+            assert(self.reads.executing() < 2);
+
+            const read = self.reads.acquire() orelse unreachable;
+            read.* = .{
+                .self = self,
+                .completion = undefined,
+                .message = message.ref(),
+                .callback = undefined,
+                .op = offset,
+                .checksum = undefined,
+                .destination_replica = version,
+            };
+
+            const buffer = self.recover_headers_buffer(message, offset);
+
+            log.debug("{}: recover_headers: version={} size={} offset={}", .{
+                self.replica,
+                version,
+                buffer.len,
+                offset,
+            });
+
+            self.storage.read_sectors(
+                recover_headers_on_read,
+                &read.completion,
+                buffer,
+                self.offset_in_headers_version(offset, version),
+            );
+        }
+
+        fn recover_headers_buffer(self: *Self, message: *Message, offset: u64) []u8 {
+            const max = std.math.min(message.buffer.len, self.size_headers - offset);
+            return message.buffer[0..std.math.min(max, config.sector_size * 200)];
+        }
+
+        fn recover_headers_on_read(completion: *Storage.Read) void {
+            const read = @fieldParentPtr(Self.Read, "completion", completion);
+            const self = read.self;
+            const replica = @fieldParentPtr(Replica, "journal", self);
+            const message = read.message;
+
+            const offset = read.op;
+            const version = @intCast(u1, read.destination_replica.?);
+            const buffer = self.recover_headers_buffer(message, offset);
+            const size = buffer.len;
+
+            log.debug("{}: recover_headers: version={} size={} offset={} completed", .{
+                self.replica,
+                version,
+                size,
+                offset,
+            });
+
+            replica.message_bus.unref(read.message);
+            self.reads.release(read);
+
+            // headers must be zeroed to start
+            // iterate buffer headers
+            // if checksum invalid, ignore
+            // zeroed + reserved = reserved
+            // zeroed + op = op
+            // exists=reserved + reserved = reserved (this means both versions had reserved)
+            // exists=op + reserved = op (this means one of the two versions had an op)
+            // op + op = ?
+            //   this one is interesting, because even if we write to both header versions,
+            //   one write may be a ghost
+            //   leverage the log itself, that's where we write first, read there first, that tells us the header
+            //   if the header is corrupt, then we look to in-memory headers (unless reserved)
+
+            // compare {reserved, reserved}
+
+            self.recover_headers(offset + size, version);
+            // we need to figure out which headers are newer
+            // if any headers are corrupt we want to read the other copy from the log
         }
 
         /// A safe way of removing an entry, where the header must match the current entry to succeed.

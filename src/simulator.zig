@@ -16,7 +16,7 @@ const output = std.log.scoped(.state_checker);
 
 /// Set this to `false` if you want to see how literally everything works.
 /// This will run much slower but will trace all logic across the cluster.
-const log_state_transitions_only = std.builtin.mode != .Debug;
+const log_state_transitions_only = false;//std.builtin.mode != .Debug;
 
 /// You can fine tune your log levels even further (debug/info/notice/warn/err/crit/alert/emerg):
 pub const log_level: std.log.Level = if (log_state_transitions_only) .info else .debug;

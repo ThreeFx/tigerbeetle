@@ -115,7 +115,7 @@ pub fn Replica(
         /// This is the most crucial aspect of the protocol to get right, especially because it can
         /// slip past any protection provided by the hash chain. For example, we may have a fully
         /// connected hash chain but with uncommitted ops that never survived into the newer view.
-        view_jump_barrier: bool = false,
+        view_jump_barrier: ?u64 = null,
 
         /// The current status, either normal, view_change, or recovering:
         /// TODO Don't default to normal, set the starting status according to the journal's health.
@@ -383,6 +383,14 @@ pub fn Replica(
 
             self.clock.tick();
 
+            if (!self.journal.recovered) {
+                if (true) @panic("we should not be here just yet");
+                self.journal.recover();
+                return;
+            } else {
+                assert(!self.journal.recovering);
+            }
+
             self.ping_timeout.tick();
             self.prepare_timeout.tick();
             self.commit_timeout.tick();
@@ -426,6 +434,14 @@ pub fn Replica(
                     message.header.cluster,
                 });
                 return;
+            }
+
+            if (!self.journal.recovered) {
+                self.journal.recover();
+                log.debug("{}: on_message: waiting for journal to recover", .{self.replica});
+                return;
+            } else {
+                assert(!self.journal.recovering);
             }
 
             assert(message.header.replica < self.replica_count);
@@ -633,9 +649,9 @@ pub fn Replica(
             self.journal.set_entry_as_dirty(message.header);
 
             // We have the latest op from the leader and have cleared the view jump barrier:
-            if (self.view_jump_barrier) {
-                self.view_jump_barrier = false;
-                log.debug("{}: on_prepare: cleared view jump barrier", .{self.replica});
+            if (self.view_jump_barrier) |commit_max| {
+                self.view_jump_barrier = null;
+                log.debug("{}: on_prepare: cleared view jump barrier={}", .{self.replica, commit_max,});
             }
 
             self.replicate(message);
@@ -770,8 +786,8 @@ pub fn Replica(
                 return;
             }
 
-            if (self.view_jump_barrier) {
-                log.debug("{}: on_repair: ignoring (view jump barrier)", .{self.replica});
+            if (self.view_jump_barrier) |commit_max| {
+                log.debug("{}: on_repair: ignoring (view jump barrier={})", .{self.replica, commit_max,});
                 return;
             }
 
@@ -919,12 +935,13 @@ pub fn Replica(
             }
 
             self.set_latest_op_and_k(&latest, k.?, "on_do_view_change");
-            assert(!self.view_jump_barrier);
+            assert(self.view_jump_barrier == null);
 
             // Now that we have the latest op in place, repair any other headers:
-            for (self.do_view_change_from_all_replicas) |received| {
+            for (self.do_view_change_from_all_replicas) |received, replica| {
                 if (received) |m| {
                     for (self.message_body_as_headers(m)) |*h| {
+                        log.debug("{}: on_do_view_change: replica={} header={}", .{self.replica, replica, h.*,});
                         _ = self.repair_header(h);
                     }
                 }
@@ -940,6 +957,10 @@ pub fn Replica(
             self.discard_uncommitted_headers();
             assert(self.op >= self.commit_max);
             assert(self.journal.entry_for_op_exact(self.op) != null);
+
+            if (self.replica == 3 and self.view == 43) {
+                @panic("on_do_view_change");
+            }
 
             // Start repairs according to the CTRL protocol:
             assert(!self.repair_timeout.ticking);
@@ -966,7 +987,7 @@ pub fn Replica(
 
             // In ignore_view_change_message(), we will allow a start_view message through for the
             // same view in normal status if a view jump barrier exists that needs to be cleared:
-            assert(self.status == .view_change or self.view_jump_barrier);
+            assert(self.status == .view_change or self.view_jump_barrier != null);
             assert(message.header.view == self.view);
 
             var latest = Header.reserved();
@@ -974,7 +995,7 @@ pub fn Replica(
             assert(latest.op == message.header.op);
 
             self.set_latest_op_and_k(&latest, message.header.commit, "on_start_view");
-            assert(!self.view_jump_barrier);
+            assert(self.view_jump_barrier == null);
 
             // Now that we have the latest op in place, repair any other headers:
             for (self.message_body_as_headers(message)) |*h| {
@@ -1281,8 +1302,8 @@ pub fn Replica(
             // We expect at least one header in the body, or otherwise no response to our request.
             assert(message.header.size > @sizeOf(Header));
 
-            if (self.view_jump_barrier) {
-                log.debug("{}: on_headers: ignoring (view jump barrier)", .{self.replica});
+            if (self.view_jump_barrier) |commit_max| {
+                log.debug("{}: on_headers: ignoring (view jump barrier={})", .{self.replica, commit_max,});
                 return;
             }
 
@@ -1618,7 +1639,7 @@ pub fn Replica(
                 self.committing = false;
                 return;
             }
-            assert(!self.view_jump_barrier);
+            assert(self.view_jump_barrier == null);
             assert(self.op >= self.commit_max);
 
             // We may receive commit numbers for ops we do not yet have (`commit_max > self.op`):
@@ -1937,12 +1958,23 @@ pub fn Replica(
             const message = self.message_bus.get_message() orelse return null;
             defer self.message_bus.unref(message);
 
+            log.debug("{}: create_view_change_message: {s} view={} op={}..{} commit_max={}", .{
+                self.replica,
+                @tagName(command),
+                self.view,
+                self.op,
+                self.view_jump_barrier orelse self.op,
+                self.commit_max,
+            });
+
+            const op = self.op;//self.view_jump_barrier orelse self.op;
+
             message.header.* = .{
                 .command = command,
                 .cluster = self.cluster,
                 .replica = self.replica,
                 .view = self.view,
-                .op = self.op,
+                .op = op,
                 .commit = self.commit_max,
             };
 
@@ -1956,7 +1988,7 @@ pub fn Replica(
 
             const count = self.journal.copy_latest_headers_between(
                 0,
-                self.op,
+                op,
                 std.mem.bytesAsSlice(Header, message.buffer[@sizeOf(Header)..size_max]),
             );
 
@@ -2439,7 +2471,7 @@ pub fn Replica(
             }
 
             if (message.header.view == self.view and self.status == .normal) {
-                if (message.header.command == .start_view and self.view_jump_barrier) {
+                if (message.header.command == .start_view and self.view_jump_barrier != null) {
                     // Fall through, we requested this start_view to clear our view jump barrier.
                 } else {
                     log.debug("{}: on_{s}: ignoring (view started)", .{ self.replica, command });
@@ -2629,10 +2661,10 @@ pub fn Replica(
             assert(self.journal.entry_for_op_exact(self.op) != null);
 
             // Resolve any view jump by requesting the leader's latest op:
-            if (self.view_jump_barrier) {
+            if (self.view_jump_barrier) |commit_max| {
                 assert(self.status == .normal);
                 assert(self.follower());
-                log.debug("{}: repair: resolving view jump barrier", .{self.replica});
+                log.debug("{}: repair: resolving view jump barrier={}", .{self.replica, commit_max});
                 self.send_header_to_replica(self.leader_index(self.view), .{
                     .command = .request_start_view,
                     .cluster = self.cluster,
@@ -2673,7 +2705,7 @@ pub fn Replica(
 
             // Request any missing or disconnected headers:
             // TODO Snapshots: Ensure that self.commit_min op always exists in the journal.
-            assert(!self.view_jump_barrier);
+            assert(self.view_jump_barrier == null);
             var broken = self.journal.find_latest_headers_break_between(self.commit_min, self.op);
             if (broken) |range| {
                 log.debug("{}: repair: break: view={} op_min={} op_max={} (commit={}..{} op={})", .{
@@ -2705,7 +2737,7 @@ pub fn Replica(
             }
 
             // Assert that all headers are now present and connected with a perfect hash chain:
-            assert(!self.view_jump_barrier);
+            assert(self.view_jump_barrier == null);
             assert(self.op >= self.commit_max);
             assert(self.valid_hash_chain_between(self.commit_min, self.op));
 
@@ -2760,7 +2792,7 @@ pub fn Replica(
         ///
         fn repair_header(self: *Self, header: *const Header) bool {
             // Do not try to do any repairs while we cannot trust `self.op`:
-            assert(!self.view_jump_barrier);
+            assert(self.view_jump_barrier == null);
 
             assert(header.valid_checksum());
             assert(header.invalid() == null);
@@ -2893,7 +2925,7 @@ pub fn Replica(
         /// do to repair reordered ops, but that we did not check for connection to the right.
         fn repair_header_would_connect_hash_chain(self: *Self, header: *const Header) bool {
             // We must be able to trust `self.op` if this function is to be reliable.
-            assert(!self.view_jump_barrier);
+            assert(self.view_jump_barrier == null);
 
             var entry = header;
 
@@ -3437,7 +3469,7 @@ pub fn Replica(
             assert(message.references == 1);
             assert(message.header.command == .do_view_change);
             assert(message.header.view == self.view);
-            assert(message.header.op == self.op);
+            //assert(message.header.op == self.view_jump_barrier orelse self.op);
             assert(message.header.commit == self.commit_max);
             // TODO Assert that latest header in message body matches self.op.
 
@@ -3564,6 +3596,7 @@ pub fn Replica(
                     assert(!self.do_view_change_quorum);
                     assert(message.header.view == self.view);
                     assert(message.header.replica == self.replica);
+                    //assert(message.header.op == self.view_jump_barrier orelse self.op);
                     assert(replica == self.leader_index(self.view));
                 },
                 .start_view => switch (self.status) {
@@ -3663,7 +3696,7 @@ pub fn Replica(
                 assert(latest.view < self.view); // Latest normal view before this view change.
             } else {
                 assert(latest.view <= self.view);
-                assert(self.view_jump_barrier);
+                assert(self.view_jump_barrier != null);
             }
 
             log.debug("{}: {s}: view={} op={}..{} commit={}..{} checksum={} offset={}", .{
@@ -3726,9 +3759,9 @@ pub fn Replica(
             self.journal.remove_entries_from(self.op + 1);
             assert(self.journal.entry_for_op_exact(self.op).?.checksum == latest.checksum);
 
-            if (self.view_jump_barrier) {
-                self.view_jump_barrier = false;
-                log.debug("{}: {s}: resolved view jump barrier", .{ self.replica, method });
+            if (self.view_jump_barrier) |commit_max| {
+                self.view_jump_barrier = null;
+                log.debug("{}: {s}: resolved view jump barrier={}", .{ self.replica, method, commit_max, });
             }
         }
 
@@ -3737,7 +3770,7 @@ pub fn Replica(
             assert(self.leader_index(self.view) == self.replica);
             assert(self.do_view_change_quorum);
 
-            assert(!self.view_jump_barrier);
+            assert(self.view_jump_barrier == null);
             assert(!self.committing);
             assert(!self.repairing_pipeline);
 
@@ -3930,10 +3963,11 @@ pub fn Replica(
         fn valid_hash_chain(self: *Self, method: []const u8) bool {
             // If we know we have uncommitted ops that may have been reordered through a view change
             // then wait until the latest of these has been resolved with the leader:
-            if (self.view_jump_barrier) {
-                log.debug("{}: {s}: waiting to resolve view jump barrier", .{
+            if (self.view_jump_barrier) |commit_max| {
+                log.debug("{}: {s}: waiting to resolve view jump barrier={}", .{
                     self.replica,
                     method,
+                    commit_max,
                 });
                 return false;
             }
@@ -4091,14 +4125,14 @@ pub fn Replica(
                 // This is safe because advancing our latest op in the current view or receiving
                 // it from the leader ensures that we have the latest hash chain head, from which we
                 // can work backwards to disambiguate any ops.
-                log.debug("{}: view_jump: imposing view jump barrier", .{self.replica});
-                self.view_jump_barrier = true;
+                log.debug("{}: view_jump: imposing view jump barrier={}", .{self.replica, self.commit_max,});
+                self.view_jump_barrier = self.commit_max;
             } else {
                 assert(self.op <= self.commit_max);
 
                 // Crucially, we may still need to resolve any prior view jump barrier:
                 // For example, if we jump to view 3 and then view 7 both in normal status.
-                assert(self.view_jump_barrier == true or self.view_jump_barrier == false);
+                assert(self.view_jump_barrier != null or self.view_jump_barrier == null);
             }
 
             switch (into) {
